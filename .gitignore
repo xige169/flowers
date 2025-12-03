@@ -2,6 +2,9 @@
 *.docx
 *.doc
 
+# 排除 CSV 文件
+*.csv
+
 # 排除 Python 缓存
 __pycache__/
 *.py[cod]
@@ -18,6 +21,7 @@ __pycache__/
 model/best_model.pth
 *.pth
 *.pt
+*.safetensors
 
 # 排除大型数据集
 train/
