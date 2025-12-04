@@ -1,16 +1,34 @@
+"""
+预测模块
+
+该模块提供了图像批量预测功能，加载训练好的模型对测试图片进行分类预测，
+并将结果保存为 CSV 文件。
+"""
+
 import os
+import argparse
 import torch
+import torch.nn.functional as F
 import pandas as pd
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from tqdm import tqdm
+
 from model import create_model
 from utils import load_config
-import torch.nn.functional as F
-import argparse
+
 
 class FlowerDataset(Dataset):
+    """
+    花卉图片数据集（用于预测）
+    
+    Args:
+        image_files: 图片文件名列表
+        img_dir: 图片目录路径
+        transform: 数据变换
+    """
+    
     def __init__(self, image_files, img_dir, transform=None):
         self.image_files = image_files
         self.img_dir = img_dir
@@ -34,12 +52,21 @@ class FlowerDataset(Dataset):
 
 
 def load_model(model_path):
-    """加载模型"""
+    """
+    加载训练好的模型
+    
+    Args:
+        model_path: 模型文件路径
+        
+    Returns:
+        model: 加载好的模型
+        device: 使用的设备
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     checkpoint = torch.load(model_path, map_location=device)
 
     config = load_config()
-    model = create_model(checkpoint['num_classes'], checkpoint['model_name'],predicted=False)
+    model = create_model(checkpoint['num_classes'], checkpoint['model_name'], predicted=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()
@@ -48,7 +75,14 @@ def load_model(model_path):
 
 
 def predict_images(model_path, test_dir, output_path):
-    """预测图片并保存结果"""
+    """
+    预测图片并保存结果
+    
+    Args:
+        model_path: 模型文件路径
+        test_dir: 测试图片目录
+        output_path: 结果保存路径
+    """
     # 加载模型
     model, device = load_model(model_path)
 
@@ -103,10 +137,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='花卉分类模型预测')
 
     # 位置参数：测试集文件夹和输出文件
-    parser.add_argument('test_img_dir', type=str,
-                        help='测试图片目录')
-    parser.add_argument('output_path', type=str,
-                        help='预测结果输出路径 (CSV文件)')
+    parser.add_argument('test_img_dir', type=str, help='测试图片目录')
+    parser.add_argument('output_path', type=str, help='预测结果输出路径 (CSV文件)')
     args = parser.parse_args()
 
     model_path = '../model/best_model.pth'

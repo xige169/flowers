@@ -1,21 +1,37 @@
+"""
+训练模块
+
+该模块提供了模型训练的完整流程，包括数据加载、多阶段训练策略、
+学习率调度和模型保存等功能。
+"""
+
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
-import os
 from PIL import Image, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 from model import create_model
-from utils import FlowerDataset, split_data
-from utils import load_config
+from utils import FlowerDataset, split_data, load_config
 
 config = load_config()
-# 基本设置
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
 def set_train_layers(model, stage=1):
+    """
+    设置模型的可训练层
+    
+    根据训练阶段设置不同的层为可训练或冻结状态，实现渐进式微调。
+    
+    Args:
+        model: 要配置的模型
+        stage: 训练阶段（1: 只训练分类头, 2: 解冻部分层, 3: 全解冻）
+    """
     backbone = model.features
 
     if stage == 1:
@@ -62,13 +78,23 @@ def set_train_layers(model, stage=1):
             param.requires_grad = True
         print("阶段3: 全解冻")
 
-    return
 
 def load_dataset(batch_size):
+    """
+    加载并预处理数据集
+    
+    Args:
+        batch_size: 批次大小
+        
+    Returns:
+        train_loader: 训练数据加载器
+        val_loader: 验证数据加载器
+    """
     # 数据路径
     csv_path = config['csv_path']
     img_dir = config['img_dir']
     train_df, val_df = split_data(csv_path)
+    
     # 数据变换
     train_transform = transforms.Compose([
         transforms.Resize((config['input_size'], config['input_size'])),
@@ -90,24 +116,38 @@ def load_dataset(batch_size):
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     return train_loader, val_loader
 
+
 def train(model, criterion, stage, base_lr, best_acc):
-    if stage==1:
-        lr=base_lr * 0.5
-        epochs =25
+    """
+    执行单个训练阶段
+    
+    Args:
+        model: 要训练的模型
+        criterion: 损失函数
+        stage: 训练阶段
+        base_lr: 基础学习率
+        best_acc: 当前最佳准确率
+        
+    Returns:
+        best_acc: 更新后的最佳准确率
+    """
+    if stage == 1:
+        lr = base_lr * 0.5
+        epochs = 25
         batch = 16
-    elif stage ==2:
+    elif stage == 2:
         lr = base_lr * 0.1
         epochs = 13
         batch = 8
     else:
-        lr = base_lr*0.01
+        lr = base_lr * 0.01
         epochs = 30
         batch = 8
 
     train_loader, val_loader = load_dataset(batch)
 
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),lr=lr, weight_decay=0.05)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr*0.1) 
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=0.05)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.1)
 
     # 训练
     for epoch in range(epochs):
@@ -164,20 +204,24 @@ def train(model, criterion, stage, base_lr, best_acc):
         scheduler.step()
     return best_acc
 
+
 def train_model():
-    # 划分数据
-
+    """
+    执行完整的模型训练流程
+    
+    包括模型创建、多阶段训练和最终模型保存。
+    """
     num_classes = config['num_classes']
-
-    # 创建模型
     model_name = config['model_name']
-    model = create_model(num_classes, model_name,predicted=True).to(device)
-    criterion = nn.CrossEntropyLoss(label_smoothing= 0.1)
+    
+    # 创建模型
+    model = create_model(num_classes, model_name, predicted=True).to(device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     best_acc = 0.0
-    for i in range(2,3):
+    for i in range(1, 4):
         stage = i
-        set_train_layers(model,stage)
+        set_train_layers(model, stage)
         best_acc = train(model, criterion, stage, config['learning_rate'], best_acc)
 
 
