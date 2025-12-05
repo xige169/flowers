@@ -1,8 +1,11 @@
 """
 训练模块
 
-该模块提供了模型训练的完整流程，包括数据加载、多阶段训练策略、
-学习率调度和模型保存等功能。
+该模块提供了模型训练的完整流程，包括：
+1. 渐进式微调策略 (set_train_layers)。
+2. 数据加载与预处理 (load_dataset)。
+3. 训练与验证循环 (train)。
+4. 模型保存与早停。
 """
 
 import os
@@ -12,125 +15,133 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
-from PIL import Image, ImageFile
+from PIL import ImageFile
+from typing import Tuple
 
+# 防止截断图片报错
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 from model import create_model
 from utils import FlowerDataset, split_data, load_config
 
+# 全局配置和变量
 config = load_config()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def set_train_layers(model, stage=1):
-    """
-    设置模型的可训练层
-    
-    根据训练阶段设置不同的层为可训练或冻结状态，实现渐进式微调。
-    
+def set_train_layers(model: nn.Module, stage: int = 1) -> None:
+    """设置模型的可训练层，实现渐进式微调。
+
     Args:
-        model: 要配置的模型
-        stage: 训练阶段（1: 只训练分类头, 2: 解冻部分层, 3: 全解冻）
+        model (nn.Module): 待训练的模型。
+        stage (int): 训练阶段。
+            - 1: 冻结 Backbone，只训练分类头 (Head)。
+            - 2: 解冻最后几层 Transformer/Conv 层。
+            - 3: 解冻所有参数 (全量微调)。
     """
     backbone = model.features
+    
+    # 辅助函数：冻结/解冻参数
+    def freeze(module, requires_grad=False):
+        for param in module.parameters():
+            param.requires_grad = requires_grad
 
     if stage == 1:
-        # === 阶段1: 冻结所有层，只训练 Head ===
-        for param in backbone.parameters():
-            param.requires_grad = False
-        for param in model.head.parameters():
-            param.requires_grad = True
+        # === 阶段1: 冻结 Backbone，只训练 Head ===
+        freeze(backbone, False)
+        freeze(model.head, True)
         print("阶段1: 冻结 Backbone，只训练分类头")
 
     elif stage == 2:
-        # 先冻结所有
-        for param in backbone.parameters():
-            param.requires_grad = False
+        # === 阶段2: 解冻部分 Transformer 层 ===
+        freeze(backbone, False) # 先全部冻结
 
+        # 尝试查找 Transformer 层
         transformer_layers = getattr(backbone, 'layer', None)
-
-        # 如果没找到，尝试找 encoder.layer (DINOv2 标准结构)
         if transformer_layers is None and hasattr(backbone, 'encoder'):
+            # DINOv2 / ViT 常见结构
             transformer_layers = getattr(backbone.encoder, 'layer', None)
 
         if transformer_layers is not None:
             total_layers = len(transformer_layers)
             # 解冻最后 3 层
             start_layer = max(0, total_layers - 3)
-
             print(f"阶段2: 解冻 Transformer Layer {start_layer} 到 {total_layers - 1}")
+            
             for i in range(start_layer, total_layers):
-                for param in transformer_layers[i].parameters():
-                    param.requires_grad = True
+                freeze(transformer_layers[i], True)
         else:
-            print("警告: 没找到 Transformer 层，尝试解冻最后部分参数")
-            # 兜底策略：如果都找不到，解冻所有参数
-            for param in backbone.parameters():
-                param.requires_grad = True
+            print("警告: 没找到 Transformer 层，尝试解冻最后部分参数 (兜底策略)")
+            # 兜底：解冻整个 backbone (或者可以做得更细致，但保留原逻辑是解冻所有)
+            freeze(backbone, True)
 
-        # 确保 Head 始终解冻
-        for param in model.head.parameters():
-            param.requires_grad = True
+        # Head 始终解冻
+        freeze(model.head, True)
 
     else:
         # === 阶段3: 全量微调 ===
-        for param in model.parameters():
-            param.requires_grad = True
+        freeze(model, True)
         print("阶段3: 全解冻")
 
 
-def load_dataset(batch_size):
-    """
-    加载并预处理数据集
-    
+def load_dataset(batch_size: int) -> Tuple[DataLoader, DataLoader]:
+    """加载并预处理数据集。
+
     Args:
-        batch_size: 批次大小
-        
+        batch_size (int): 批大小。
+
     Returns:
-        train_loader: 训练数据加载器
-        val_loader: 验证数据加载器
+        Tuple[DataLoader, DataLoader]: (训练DataLoader, 验证DataLoader)。
     """
-    # 数据路径
     csv_path = config['csv_path']
     img_dir = config['img_dir']
+    
     train_df, val_df = split_data(csv_path)
     
-    # 数据变换
+    # 标准化参数
+    normalize = transforms.Normalize([0.485, 0.456, 0.406], 
+                                     [0.229, 0.224, 0.225])
+    
+    input_size = config['input_size']
+    
+    # 定义 Transform
     train_transform = transforms.Compose([
-        transforms.Resize((config['input_size'], config['input_size'])),
+        transforms.Resize((input_size, input_size)),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        normalize
     ])
 
     val_transform = transforms.Compose([
-        transforms.Resize((config['input_size'], config['input_size'])),
+        transforms.Resize((input_size, input_size)),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        normalize
     ])
 
-    # 创建数据集
+    # 实例化数据集
     train_dataset = FlowerDataset(train_df, img_dir, train_transform)
     val_dataset = FlowerDataset(val_df, img_dir, val_transform)
 
+    # 创建 DataLoader
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
     return train_loader, val_loader
 
 
-def train(model, criterion, stage, base_lr, best_acc):
-    """
-    执行单个训练阶段
-    
+def train(model: nn.Module, criterion: nn.Module, stage: int, base_lr: float, best_acc: float) -> float:
+    """执行单个阶段的训练循环。
+
     Args:
-        model: 要训练的模型
-        criterion: 损失函数
-        stage: 训练阶段
-        base_lr: 基础学习率
-        best_acc: 当前最佳准确率
-        
+        model (nn.Module): 模型。
+        criterion (nn.Module): 损失函数。
+        stage (int): 训练阶段 (1, 2, 3)。
+        base_lr (float): 基础学习率。
+        best_acc (float): 之前的最佳验证准确率。
+
     Returns:
-        best_acc: 更新后的最佳准确率
+        float: 更新后的最佳验证准确率。
     """
+    # 根据阶段设置超参数
     if stage == 1:
         lr = base_lr * 0.5
         epochs = 25
@@ -139,25 +150,27 @@ def train(model, criterion, stage, base_lr, best_acc):
         lr = base_lr * 0.1
         epochs = 13
         batch = 8
-    else:
+    else: # stage 3
         lr = base_lr * 0.01
         epochs = 30
         batch = 8
 
     train_loader, val_loader = load_dataset(batch)
-
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=0.05)
+    
+    # 优化器与调度器
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
+                            lr=lr, weight_decay=0.05)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.1)
 
-    # 训练
     for epoch in range(epochs):
-        # ===== 训练阶段 =====
+        # ==================== Training ====================
         model.train()
         train_loss = 0.0
         train_correct = 0
         train_total = 0
 
-        for images, labels in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs} Train'):
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs} [Stage {stage}] Train')
+        for images, labels in pbar:
             images, labels = images.to(device), labels.to(device)
 
             optimizer.zero_grad()
@@ -170,60 +183,81 @@ def train(model, criterion, stage, base_lr, best_acc):
             _, predicted = torch.max(outputs, 1)
             train_total += labels.size(0)
             train_correct += (predicted == labels).sum().item()
-        train_acc = 100 * train_correct / train_total
-        train_loss = train_loss / train_total
+            
+            # 实时更新进度条显示 Loss
+            pbar.set_postfix({'loss': loss.item()})
 
-        # ===== 验证阶段 =====
+        train_acc = 100.0 * train_correct / train_total
+        avg_train_loss = train_loss / train_total
+
+        # ==================== Validation ====================
         model.eval()
         val_correct = 0
-        test_total = 0
+        val_total = 0
 
         with torch.no_grad():
-            for images, labels in tqdm(val_loader, desc=f'Val'):
+            for images, labels in tqdm(val_loader, desc='Val', leave=False):
                 images, labels = images.to(device), labels.to(device)
                 outputs = model(images)
                 _, predicted = torch.max(outputs, 1)
-                test_total += labels.size(0)
+                val_total += labels.size(0)
                 val_correct += (predicted == labels).sum().item()
-        val_acc = 100 * val_correct / test_total
+        
+        val_acc = 100.0 * val_correct / val_total
+        
+        print(f'Stage {stage} Epoch {epoch + 1}: '
+              f'Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.2f}%, '
+              f'Val Acc: {val_acc:.2f}%')
 
-        print(f'Epoch {epoch + 1}: Train loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Val Acc: {val_acc:.2f}%')
-
-        # 保存最佳模型
+        # ==================== Save Best Model ====================
         if val_acc > best_acc:
             best_acc = val_acc
             os.makedirs('../model', exist_ok=True)
+            save_path = config['save_model_path']
+            
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'num_classes': config['num_classes'],
                 'model_name': config['model_name'],
-                'best_val_acc': best_acc
-            }, config['save_model_path'])
-            print(f'保存最佳模型，验证准确率: {best_acc:.2f}%')
+                'best_val_acc': best_acc,
+                'stage': stage,
+                'epoch': epoch
+            }, save_path)
+            
+            print(f'>>> 新的最佳模型已保存! 验证准确率: {best_acc:.2f}%')
 
         scheduler.step()
+        
     return best_acc
 
 
 def train_model():
-    """
-    执行完整的模型训练流程
-    
-    包括模型创建、多阶段训练和最终模型保存。
-    """
+    """模型训练主入口。"""
     num_classes = config['num_classes']
     model_name = config['model_name']
     
-    # 创建模型
+    print(f"开始训练流程: Model={model_name}, Classes={num_classes}")
+
+    # 初始化模型
     model = create_model(num_classes, model_name, predicted=True).to(device)
+    
+    # 标签平滑 CrossEntropy
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     best_acc = 0.0
-    for i in range(1, 4):
-        stage = i
+    
+    # 按阶段依次训练
+    for stage in range(1, 4):
+        print(f"\n{'='*20} 进入第 {stage} 阶段训练 {'='*20}")
         set_train_layers(model, stage)
         best_acc = train(model, criterion, stage, config['learning_rate'], best_acc)
+        
+    print(f"\n所有阶段训练完成。最佳验证准确率: {best_acc:.2f}%")
 
 
 if __name__ == '__main__':
-    train_model()
+    try:
+        train_model()
+    except Exception as e:
+        print(f"训练过程中发生错误: {e}")
+        raise
